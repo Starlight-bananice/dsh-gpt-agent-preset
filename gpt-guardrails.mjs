@@ -105,7 +105,17 @@ const SOURCE_KIND = 'gpt-guardrails'
  * evidence agrees: a GPT-6 agent on this harness interrupted a request with
  * "正在分析请求…我正在读取预设…" instead of executing it.
  *
- * The routing table is the second load-bearing part: the logged failure in the
+ * The SILENCE block targets the family's other documented habit: it "tends
+ * toward detailed, formatted responses" and, on long tool-heavy runs, states a
+ * short preamble before each step. Measured on a real session: five consecutive
+ * steps opened with 58-65 character restatements of the same plan, 68-80%
+ * similar to each other, for work that was 12 `read` calls and 3 `bash` calls.
+ * The provider cannot fix this from the wire side — OpenAI's `phase` field
+ * distinguishes such commentary from a final answer, but a Harness text block
+ * is only `{type: 'text', text}`, so there is nothing for the adapter to map.
+ * The prompt is where it is addressable.
+ *
+ * The routing table is the third load-bearing part: the logged failure in the
  * sessions this preset was built from was `bash` used for jobs that
  * `read`/`grep`/`glob`/`edit` own (171 of 207 calls).
  */
@@ -117,13 +127,22 @@ const CONTRACT = [
   'imperative — is authorization to do the work. Treat it as an instruction, not',
   'as a question about your capability.',
   '  Do not stop at acknowledging, proposing a plan, or offering to continue. Pick',
-  '  the reading that the wording and prior context support, state it in one line,',
-  '  and proceed. Two things override this: a mode restriction the user chose (in',
-  '  plan mode, explore and propose instead of acting), and a decision that is',
-  '  genuinely theirs — a design choice that changes the outcome, or an',
-  '  irreversible action. Ask about those before deciding; for everything else',
-  '  take the reasonable default rather than blocking. Do not add disclaimers or',
-  '  approval checklists for hypothetical risk.',
+  '  the reading that the wording and prior context support, act on it, and say',
+  '  only what the user needs in order to read the result. Two things override',
+  '  this: a mode restriction the user chose (in plan mode, explore and propose',
+  '  instead of acting), and a decision that is genuinely theirs — a design choice',
+  '  that changes the outcome, or an irreversible action. Ask about those before',
+  '  deciding; for everything else take the reasonable default rather than',
+  '  blocking. Do not add disclaimers or approval checklists for hypothetical',
+  '  risk.',
+  '',
+  'SILENCE. Announce nothing. Do not narrate the plan, restate the request, or',
+  'report that you are about to read, search, run, or verify something — the tool',
+  'calls already show that, and a line per step is noise the user has to read',
+  'past. Speak when you have something the user did not already have: a real',
+  'decision you cannot make for them, a blocker, or the answer itself. Before a',
+  'long or destructive operation, one short line is fine; before a step in a',
+  'multi-step tool sequence it is not.',
   '',
   'TOOLS. Route each job to its own tool. Shell only for processes, builds,',
   'tests, package managers, git, and pipelines:',

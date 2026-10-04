@@ -95,6 +95,20 @@ console.log('# agent/created 不派发时仍然生效（复现线上失效的形
   check('写入后重发同一清单被拒（无需 agent/created）', typeof second === 'string' && /byte-identical/.test(second), String(second).slice(0, 80))
 }
 
+console.log('# 契约必须抑制逐步骤的进度播报（实测：68-80% 相似的前缀）')
+{
+  const h = makeHarness({})
+  const a = h.agent('contract')
+  await h.emit('agent/created', { agent: a })
+  const step = await h.emit('agent/pre-step', { agent: a, messages: [], turn: 1, step: 1, signal: new AbortController().signal })
+  const text = step.messages[0].content[0].text
+  check('包含 SILENCE 规则', text.includes('SILENCE'))
+  check('明确禁止复述请求与播报工具动作', /Do not narrate the plan, restate the request/.test(text))
+  check('说明工具调用本身已足够可见', /the tool\s+calls already show that/.test(text))
+  check('允许长/危险操作前的一行说明', /one short line is fine/.test(text))
+  check('授权段不再要求"用一行说出计划"', !/state it in one line/.test(text))
+}
+
 console.log('# 连续重复仍然被抓（不能为了交错而丢掉原有能力）')
 {
   const h = makeHarness({})
