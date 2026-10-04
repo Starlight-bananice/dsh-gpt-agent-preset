@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # No dependency install on purpose: both scripts are self-contained.
+      # `harness.mjs` runs the guard plugin against a fake Cordis context, and
+      # `check-config.mjs` carries its own copy of the shipped Schemastery
+      # expressions (`tests/schemas.json`), so neither needs the app, a
+      # checkout, or the network.
+      - name: Behaviour checks
+        run: node tests/harness.mjs
+
+      - name: Config keys against shipped schemas
+        run: node tests/check-config.mjs
