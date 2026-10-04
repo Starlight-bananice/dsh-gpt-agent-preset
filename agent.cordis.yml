@@ -1,0 +1,368 @@
+# The `gpt` agent preset: a composition tuned for the OpenAI GPT-6 family —
+# `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, and `gpt-6.1-sol` — driven through
+# the ChatGPT (openai-codex) provider.
+#
+# WHAT DIFFERS INSIDE THE FAMILY (checked against each model's own page, because
+# a preset that assumes one behaviour gets the others wrong):
+#
+#   model        reasoning.effort                                        context
+#   -----------  ------------------------------------------------------  -------
+#   gpt-6-astra  low | medium | high | xhigh | max                          1.05M
+#   gpt-6-sol    none | low | medium* | high | xhigh | max                  1.05M
+#   gpt-6-luna   none | low | medium* | high | xhigh | max                  1.05M
+#   gpt-6.1-sol  low | medium* | high | xhigh | max   (no none, minimal)    1.05M
+#
+#   (* = model default. `minimal` is rejected by Luna and 6.1 Sol; `none` is
+#   rejected by Astra and 6.1 Sol, which is why one of them cannot be the
+#   preset's configured level.)
+#
+# Two consequences the composition has to respect:
+#
+#   * `none` is a real level for Sol and Luna but returns HTTP 400 on Astra and
+#     6.1 Sol, and `minimal` is rejected by Luna and 6.1 Sol. A preset must not
+#     hardcode one model's ladder; the level stays the user's pick in the model
+#     picker.
+#   * ALL of them price any request above 272K input tokens at 2x input and
+#     cache rates and 1.5x output FOR THE WHOLE REQUEST. Against a 1.05M window
+#     that makes the compaction threshold a pricing decision, not a latency
+#     one — see the compaction group below.
+#
+# WHY THIS EXISTS
+#
+# WHAT THIS PRESET DOES AND DOES NOT CLAIM
+#
+# The loops below are measured in this workspace's session logs. The prompt
+# guidance is quoted from OpenAI's own GPT-6 documentation. What is NOT claimed
+# is that the shipped presets are inherently wrong for GPT-6: the first version
+# of this preset's own enforcement never activated (an `agent/created` gate that
+# never fired), and message serialization, tool-result feedback, context
+# management, and repeated injection are all plausible contributors to the same
+# symptoms. This preset is a targeted attempt, not a diagnosis of the shipped
+# ones.
+#
+#   1. LOOPING, SHELL-FIRST TOOL USE, AND RUNAWAY CONTEXT (measured in this
+#      workspace's session logs). One session spent an entire 4.5-hour window
+#      on 300 `todo_write` and 164 `get_goal` calls and shipped nothing.
+#      Another used `bash` for 171 of 207 calls — including reading files
+#      `read` owns — against 12 `read` and 7 `glob`. A third re-read two files
+#      36 and 35 times inside a 37-step cycle, growing the context to 355K
+#      tokens until the provider aborted the stream — past the 272K pricing
+#      cliff, so every one of those requests also billed at double.
+#
+#   2. STOPPING TO ASK INSTEAD OF ACTING (documented). OpenAI's GPT-6 guide
+#      states the model "is more likely to ask the user a question when
+#      additional input could materially change the result. This can cause it
+#      to stop when the user may expect it to make reasonable assumptions and
+#      persist", that it "likes to ask non-blocking questions as it's working
+#      by default", and that unclear or conflicting guidance in a skill file
+#      "may cause the model to pause and block work early". This workspace
+#      loads the `j-space` skill plus several instruction files, so the second
+#      half of that warning applies directly. A GPT-6 session on this harness
+#      was observed answering a work request with "正在分析请求…我正在读取预设…"
+#      instead of executing it.
+#
+# The fixes pair a prompt with enforcement:
+#
+#   * an authorization block in the persona and in the per-turn contract,
+#     written from OpenAI's prescribed prompt shapes, that treats an
+#     action-shaped request as authorization and defers approval until there is
+#     a concrete result;
+#   * an explicit tool-routing table so `bash` stops being the default answer
+#     to every question;
+#   * a hard per-turn CALL BUDGET on the planning/status tools, enforced by a
+#     monotonic `ctx.tools.guard()` that returns an actionable denial;
+#   * a sliding-window cycle breaker and a per-path re-read budget, because the
+#     measured loops were interleaved (consecutive-run detection never fired)
+#     and dominated by repeat reads.
+#
+# This file is an AGENT-PLANE composition. The roster mounts it ONCE under a
+# standing scope; every session naming it joins by scope parentage, so the
+# tools and prompt sections registered here cover each joined agent while a
+# session's own state stays keyed per Session/Agent inside the plugins. The
+# host composition (`base.cordis.yml` + `web.cordis.yml`) keeps everything a
+# preset must not own: the registries themselves, the sandbox and approval
+# stack, persistence, and the model route.
+#
+# A service row here MUST sit inside a group carrying an `isolate` realm;
+# see the shipped presets for the full rationale. Noted where it applies.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# Execution-first persona, written against OpenAI's published GPT-6 guidance
+# (developers.openai.com/api/docs/guides/latest-model). `{{model}}` and `{{cwd}}`
+# are registered prompt variables, resolved at render; unknown references fail
+# assembly loudly. `dsh-persona` takes `prefix`/`suffix` (prefix required) and
+# renders them as the deployment-persona section.
+#
+# The two paragraphs are not generic encouragement — each names a behaviour the
+# GPT-6 guide documents and prescribes prompting for:
+#
+#   * "more likely to ask the user a question when additional input could
+#     materially change the result … can cause it to stop when the user may
+#     expect it to make reasonable assumptions and persist";
+#   * "more sensitive to information in context … unclear or conflicting
+#     guidance in a skill file may cause the model to pause and block work
+#     early", which matters here because this workspace loads the `j-space`
+#     skill and several AGENTS.md files;
+#   * "tends to be thorough in testing before considering a task complete …
+#     for smaller tasks, this can result in broader tests than the task
+#     requires".
+#
+# Keep this text short and stable: it is the head of every request, so an edit
+# here invalidates the prompt-cache prefix for every session that starts after.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: |-
+      You are a coding agent powered by the {{model}} model.
+
+      User instructions take precedence over any skill, AGENTS.md, or convention file you read. Those files are reference material about this workspace; when one appears to conflict with what the user asked for, follow the user and say which file you set aside.
+
+      You are judged by the work you finish, not by what you propose. Bias toward action: when a request implies authorization, carry it to completion rather than stopping at a plan, an offer to continue, or a question you could answer by looking. Ask the user only for choices that are theirs to make, and ask once you have something concrete for them to review.
+    suffix: Your working directory is {{cwd}}.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# The preset's own guard plugin: per-turn call budgets, an identical-call
+# breaker, and the operating contract injected into every turn's pre-step
+# batch. Relative rows resolve from this preset's own directory, and a locally
+# authored preset lives under the user home where `@deepseek-ai/*` is NOT
+# resolvable, so this module imports nothing outside itself.
+- id: gpt-guardrails
+  name: ./gpt-guardrails.mjs
+  config:
+    # Per-turn budgets, for the two calls that are pure re-reads of state the
+    # model already has. `get_goal` returns the goal; `create_goal` is once per
+    # session by nature. A denial names the budget and what to do instead.
+    #
+    # `update_goal` and `todo_write` are deliberately NOT budgeted:
+    #   * `update_goal` — one turn legitimately runs resume -> complete;
+    #   * `todo_write`  — its model-facing description says "Mark each todo
+    #     `completed` as soon as it is done", so a per-turn cap makes the tool
+    #     unusable. Repetition is handled by the identical-list check instead.
+    # Setting `todo_write: N` here re-enables a hard cap as an escape hatch.
+    budgets:
+      get_goal: 1
+      create_goal: 1
+    # Occurrences of one exact (tool, arguments) call INSIDE the sliding window
+    # that trip the cycle breaker. Measured rationale: the loop that defeated
+    # consecutive-run detection was `bash -> read A -> read B` × 35, so its
+    # repeats were never adjacent. The deployment-wide repeat-tool-reminder
+    # still counts runs (3/5/8) and stayed silent through all 129 calls.
+    repeatThresholds: [2, 4]
+    repeatWindow: 12
+    # Times one exact (path, offset, limit) may be read per session. Released
+    # for a path as soon as that file is written or edited, so verifying an
+    # edit is never blocked. 0 disables the limit.
+    readBudget: 2
+    # The operating contract is appended to the pre-step batch ONCE PER AGENT
+    # (the first step that agent takes), not once per turn — `injected` is keyed
+    # by agent. Repeated per-turn injection would append the whole block to every
+    # request and work against prompt-cache reuse.
+    injectContract: true
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+# `shell-env` stays in the HOST composition: `apps/cli/src/web.ts` injects it
+# to publish `DSH_WEB_URL`/`DSH_WEB_MODE`, and a host row that injects a
+# service is the criterion for host-plane ownership. Both shell tools consume
+# the host registry from here; their executors are host-plane too.
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+# Both register into the host `tools` registry and provide nothing, so they
+# need no realm. The `fs` service and its policy stay in the host.
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ─────────────────────────────────────────────────────────
+
+# Only the model-facing controls. The task REGISTRY stays on the host plane,
+# because `tool-bash` above resolves it with `ctx.get` and an entry-local
+# realm here would be invisible to that sibling row.
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+# The skill REGISTRY lives in the host composition and is layered per scope:
+# these rows register into THIS preset's layer.
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+# The `/goal` command row is carried for parity with the shipped standard
+# preset: the command is a human surface, and a preset that silently dropped it
+# would make `/goal` unavailable in GPT sessions only.
+- id: command-goal
+  name: '@deepseek-ai/dsh-command-goal'
+
+# Only the model-facing tool. The goal SERVICE, its session driver, and the
+# `/goal` command stay on the host plane. Auto-continuation rounds are the
+# amplifier this preset budgets against: a goal round is a NEW turn, so it
+# resets the per-turn budget, which is why the contract tells the model that a
+# continuation round must produce durable progress or be marked blocked.
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+  config:
+    blockedAfterConsecutiveRounds: 3
+
+# ── plan mode ───────────────────────────────────────────────────────────────
+
+# Plan state is per-agent by nature, so an entry-local realm is correct here.
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+          You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+          Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+          The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+          Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+          Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+          When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+# `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner
+# must share this realm rather than sit outside it. `tokenMeter` deliberately
+# stays on the HOST plane.
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    # Compact EARLY, and for a reason that is about money rather than latency:
+    # every GPT-6 model prices any request above 272K input tokens at 2x input
+    # and cache rates and 1.5x output FOR THE WHOLE REQUEST. Sol and Luna's
+    # context window is 1,050,000, so the shipped default (0.8) would not
+    # compact until ~840K and the 0.5 this preset first used would not compact
+    # until ~525K — both far past the cliff, on every request.
+    #
+    # 0.25 of 1,050,000 is ~262K, which keeps the live context under the
+    # threshold. retainRatio 0.06 (~63K) is the recent window kept verbatim;
+    # the remainder is summarized by `compaction-basic`.
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+      config:
+        thresholdRatio: 0.25
+        retainRatio: 0.06
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation and workflows ────────────────────────────────────────────────
+
+# The `subagents` registry and its spawn/fork backends live in the HOST
+# composition. This preset contributes the delegation TOOLS. `workflows` is
+# agent-local, so every row reaching it shares one entry-local realm here.
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        modelSelectionSettings: true
+        backgroundMode: continuable
+
+    - id: tool-subagent-fork
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: fork
+        toolName: subagent_fork
+        backgroundMode: continuable
+
+    - id: workflow-ptc
+      name: '@deepseek-ai/dsh-workflow-ptc'
+      config:
+        provider: spawn
+
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+
+    # Off for this preset: an unbounded self-continuation loop is exactly the
+    # shape this composition exists to prevent. Re-enable by copying the
+    # preset if that trade is wanted.
+    - id: tool-ralph
+      name: '@deepseek-ai/dsh-tool-ralph'
+      disabled: true
+      config:
+        subagentProvider: spawn
+        maxRounds: 64
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+# Single-active discipline: the model-facing instruction and the accepted
+# input move together, so a call marking two tasks in progress is rejected
+# instead of quietly tolerated.
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: false
+
+# The `web` service and its search provider stay in the host composition; only
+# the model-facing tool is per-session.
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: true
+    searchTimeoutMs: 60000
+
+- id: present
+  name: '@deepseek-ai/dsh-tool-present'
+
+- id: tool-plugin-manager
+  name: '@deepseek-ai/dsh-plugin-manager/tools'
+  disabled: true
